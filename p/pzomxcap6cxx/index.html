@@ -152,7 +152,8 @@
     const box = $('#tour'), cv = box.querySelector('canvas');
     const gl = cv.getContext('webgl2') || cv.getContext('webgl');
     if (!gl) { box.innerHTML = `<img src="${panos[0].image}" style="width:100%;height:100%;object-fit:cover">`; return; }
-    const vs = 'attribute vec2 p; varying vec2 uv; void main(){ uv = p; gl_Position = vec4(p, 0.0, 1.0); }';
+    const gl2 = typeof WebGL2RenderingContext !== 'undefined' && gl instanceof WebGL2RenderingContext;
+    const vs = gl2 ? '#version 300 es\nin vec2 p; out vec2 uv; void main(){ uv = p; gl_Position = vec4(p, 0.0, 1.0); }' : 'attribute vec2 p; varying vec2 uv; void main(){ uv = p; gl_Position = vec4(p, 0.0, 1.0); }';
     const fs = `precision highp float; varying vec2 uv; uniform sampler2D tex; uniform float yaw, pitch, fov, aspect;
       void main(){
         vec3 d = normalize(vec3(uv.x * tan(fov * 0.5) * aspect, uv.y * tan(fov * 0.5), -1.0));
@@ -161,14 +162,39 @@
         float u = atan(d.x, -d.z) / 6.2831853 + 0.5, v = acos(clamp(d.y, -1.0, 1.0)) / 3.1415927;
         gl_FragColor = texture2D(tex, vec2(fract(u), v));
       }`;
+    // WebGL2: derivadas calculadas sin el salto de u en la costura (si no, se ve una línea borrosa vertical).
+    const fs2 = `#version 300 es
+      precision highp float; in vec2 uv; out vec4 color; uniform sampler2D tex; uniform float yaw, pitch, fov, aspect;
+      void main(){
+        vec3 d = normalize(vec3(uv.x * tan(fov * 0.5) * aspect, uv.y * tan(fov * 0.5), -1.0));
+        float cp = cos(pitch), sp = sin(pitch); d = vec3(d.x, d.y * cp + d.z * sp, -d.y * sp + d.z * cp);
+        float cy = cos(yaw), sy = sin(yaw); d = vec3(d.x * cy + d.z * sy, d.y, -d.x * sy + d.z * cy);
+        float u = atan(d.x, -d.z) / 6.2831853 + 0.5, v = acos(clamp(d.y, -1.0, 1.0)) / 3.1415927;
+        vec2 du = vec2(dFdx(u), dFdy(u)); du -= floor(du + 0.5);
+        color = textureGrad(tex, vec2(u, v), vec2(du.x, dFdx(v)), vec2(du.y, dFdy(v)));
+      }`;
     const sh = (t, s) => { const o = gl.createShader(t); gl.shaderSource(o, s); gl.compileShader(o); return o; };
-    const pr = gl.createProgram(); gl.attachShader(pr, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(pr, sh(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(pr); gl.useProgram(pr);
+    const pr = gl.createProgram(); gl.attachShader(pr, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(pr, sh(gl.FRAGMENT_SHADER, gl2 ? fs2 : fs)); gl.linkProgram(pr); gl.useProgram(pr);
     const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
     const loc = gl.getAttribLocation(pr, 'p'); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
     const U = n => gl.getUniformLocation(pr, n);
     const tex = gl.createTexture();
-    let yaw = 0, pitch = 0, fov = 1.35, ready = false;
-    const load = i => { const img = new Image(); img.onload = () => { gl.bindTexture(gl.TEXTURE_2D, tex); gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, img); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE); ready = true; draw(); }; img.src = panos[i].image; };
+    // Campo de visión inicial ≈ 90° en horizontal (como una foto gran angular): más abierto deforma los bordes.
+    const fov0 = () => Math.min(1.35, 2 * Math.atan(Math.tan(0.8) / Math.max(0.6, cv.clientWidth / Math.max(1, cv.clientHeight))));
+    let yaw = 0, pitch = 0, fov = fov0(), ready = false;
+    // Panorámica en la GPU: con mipmaps y filtro anisótropo; si el móvil no admite texturas tan grandes, se reduce antes.
+    const maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+    const load = i => { const img = new Image(); img.decoding = 'async'; img.onload = () => {
+      let src = img;
+      if (img.width > maxTex) { const c = document.createElement('canvas'); c.width = maxTex; c.height = maxTex / 2; c.getContext('2d').drawImage(img, 0, 0, c.width, c.height); src = c; }
+      gl.bindTexture(gl.TEXTURE_2D, tex); gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, src);
+      const pot = ((src.width & (src.width - 1)) === 0 && (src.height & (src.height - 1)) === 0);
+      const mip = gl2 || pot; if (mip) gl.generateMipmap(gl.TEXTURE_2D);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, mip ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl2 || pot ? gl.REPEAT : gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      const an = gl.getExtension('EXT_texture_filter_anisotropic'); if (an) gl.texParameterf(gl.TEXTURE_2D, an.TEXTURE_MAX_ANISOTROPY_EXT, Math.min(16, gl.getParameter(an.MAX_TEXTURE_MAX_ANISOTROPY_EXT)));
+      ready = true; draw(); }; img.src = panos[i].image; };
     const draw = () => {
       const w = cv.clientWidth * devicePixelRatio, h = cv.clientHeight * devicePixelRatio;
       if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
@@ -192,7 +218,7 @@
     cv.addEventListener('pointerup', up); cv.addEventListener('pointercancel', up);
     cv.addEventListener('wheel', e => { e.preventDefault(); fov = Math.min(1.9, Math.max(0.5, fov * Math.exp(e.deltaY * 0.001))); draw(); }, { passive: false });
     addEventListener('resize', draw);
-    document.querySelectorAll('.points button').forEach(b => b.addEventListener('click', () => { document.querySelectorAll('.points button').forEach(x => x.classList.remove('on')); b.classList.add('on'); yaw = 0; pitch = 0; ready = false; load(Number(b.dataset.i)); }));
+    document.querySelectorAll('.points button').forEach(b => b.addEventListener('click', () => { document.querySelectorAll('.points button').forEach(x => x.classList.remove('on')); b.classList.add('on'); yaw = 0; pitch = 0; fov = fov0(); ready = false; load(Number(b.dataset.i)); }));
     $('#fs').addEventListener('click', () => { (document.fullscreenElement ? document.exitFullscreen() : box.requestFullscreen?.())?.catch?.(() => {}); setTimeout(draw, 200); });
   }
 })();
