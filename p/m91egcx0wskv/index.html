@@ -22,6 +22,10 @@
   @media (max-width: 600px) { header.top img + .name { display: none; } }
   .lock-card button { width: 100%; margin-top: 12px; background: linear-gradient(180deg, #e3c689, #c8a462); color: #1c1a14; }
   .lock-card .err { color: #ffcfc9; min-height: 22px; margin-top: 10px; font-size: 14px; }
+  .load { margin-top: 18px; font-size: 13px; opacity: .85; transition: opacity .6s; }
+  .load.done { opacity: 0; }
+  .lbar { height: 4px; border-radius: 2px; background: rgba(255,255,255,.18); overflow: hidden; margin-bottom: 8px; }
+  .lbar i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, #e3c689, #c8a462); transition: width .25s; }
   .mark { width: 64px; height: 64px; border-radius: 16px; margin: 0 auto; background: linear-gradient(135deg, #3a9e82, #113a30); display: grid; place-items: center; font: 700 30px Georgia, serif; color: #f5d697; box-shadow: 0 10px 30px rgba(0,0,0,.3); }
   /* Presentación */
   #app { display: none; }
@@ -44,6 +48,8 @@
   .tour { position: relative; border-radius: 16px; overflow: hidden; background: #111; height: min(70vh, 560px); touch-action: none; }
   .tour canvas { width: 100%; height: 100%; display: block; cursor: grab; }
   .tour .hint { position: absolute; left: 12px; bottom: 12px; background: rgba(0,0,0,.55); color: #fff; font-size: 12.5px; padding: 6px 10px; border-radius: 10px; pointer-events: none; }
+  .tour .tload { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); background: rgba(0,0,0,.55); color: #fff; font-size: 13px; padding: 7px 14px; border-radius: 16px; opacity: 0; transition: opacity .2s; pointer-events: none; }
+  .tour .tload.on { opacity: 1; }
   .tour .fs { position: absolute; right: 12px; top: 12px; background: rgba(0,0,0,.55); color: #fff; border: 0; border-radius: 10px; padding: 8px 10px; cursor: pointer; }
   .points { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
   .points button { border: 1px solid var(--line); background: #fff; border-radius: 20px; padding: 7px 14px; font: inherit; font-size: 13.5px; cursor: pointer; }
@@ -78,6 +84,7 @@
     <input id="code" inputmode="text" maxlength="12" placeholder="XXXX-XXXX" autocapitalize="characters" spellcheck="false" aria-label="Código de acceso">
     <button type="submit" id="go">Ver mi proyecto</button>
     <div class="err" id="err"></div>
+    <div class="load" id="load"><div class="lbar"><i id="lbar"></i></div><span id="ltext">Preparando tu proyecto…</span></div>
   </form>
 </div>
 <div id="app"></div>
@@ -87,9 +94,32 @@
   const $ = s => document.querySelector(s);
   const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const money = n => Number(n || 0).toLocaleString('es-ES', { style: 'currency', currency: 'EUR' });
-  let blob = null;
-  fetch('data.bin', { cache: 'no-store' }).then(r => { if (!r.ok) throw new Error(r.status); return r.arrayBuffer(); })
-    .then(b => { blob = new Uint8Array(b); })
+  let blob = null, pending = false;
+  // Descarga con barra de progreso y tiempo estimado (las fotos y el 360° pueden ser varios MB en el móvil).
+  const fmt = s => (s < 60 ? `${Math.max(1, Math.round(s))} s` : `${Math.round(s / 60)} min`);
+  const loaded = () => {
+    $('#lbar').style.width = '100%'; $('#ltext').textContent = 'Listo';
+    setTimeout(() => $('#load').classList.add('done'), 700);
+    if (pending) { pending = false; $('#lockForm').requestSubmit(); }
+  };
+  fetch('data.bin', { cache: 'no-store' }).then(async r => {
+    if (!r.ok) throw new Error(r.status);
+    const total = Number(r.headers.get('content-length')) || 0, reader = r.body && r.body.getReader();
+    if (!reader) { blob = new Uint8Array(await r.arrayBuffer()); return loaded(); }
+    const parts = []; let got = 0; const t0 = performance.now();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      parts.push(value); got += value.length;
+      const secs = (performance.now() - t0) / 1000, pct = total && got <= total ? got / total : null;
+      $('#lbar').style.width = pct != null ? `${Math.round(pct * 100)}%` : `${Math.min(95, 10 + got / 1e5)}%`;
+      const left = pct != null && secs > 0.4 ? (total - got) / (got / secs) : null;
+      $('#ltext').textContent = pct != null ? `Cargando tu proyecto · ${Math.round(pct * 100)} %${left != null ? (left > 1.5 ? ` · quedan unos ${fmt(left)}` : ' · casi listo') : ''}` : `Cargando tu proyecto · ${(got / 1e6).toFixed(1)} MB`;
+    }
+    const b = new Uint8Array(got); let o = 0;
+    for (const p of parts) { b.set(p, o); o += p.length; }
+    blob = b; loaded();
+  })
     .catch(() => { document.body.innerHTML = '<div class="gone"><div><h2 class="serif">Este enlace ya no está disponible</h2><p>Pide a tu estudio un enlace nuevo.</p></div></div>'; });
 
   async function decrypt(code) {
@@ -106,7 +136,7 @@
   $('#lockForm').addEventListener('submit', async e => {
     e.preventDefault();
     const code = $('#code').value.toUpperCase().replace(/[^A-Z0-9]/g, '');
-    if (!blob) { $('#err').textContent = 'Cargando… inténtalo en un momento.'; return; }
+    if (!blob) { pending = true; $('#err').textContent = 'Se abrirá en cuanto termine de cargar…'; return; }
     $('#go').disabled = true; $('#err').textContent = 'Abriendo…';
     try { render(await decrypt(code)); }
     catch { $('#err').textContent = 'Código incorrecto. Revísalo e inténtalo de nuevo.'; }
@@ -124,7 +154,7 @@
       <header class="top">${c.logo ? `<img src="${c.logo}" alt="">` : ''}<span class="name">${esc(c.name)}</span><span class="grow"></span>${c.phone ? `<a class="btn mail" style="padding:8px 12px" href="tel:${esc(c.phone)}">Llamar</a>` : ''}</header>
       <div class="hero" style="${hero ? `background-image:url('${hero}')` : 'background:#1d6b57'}"><div class="cap"><div class="eyebrow">${esc(d.project.code)}${d.client?.name ? ' · ' + esc(d.client.name) : ''}</div><h1 class="serif">${esc(d.project.name)}</h1></div></div>
       <main>
-        ${d.panos.length ? `<section><h2 class="serif">Recorrido 360°</h2><div class="tour" id="tour"><canvas></canvas><div class="hint">Arrastra para mirar alrededor · pellizca o usa la rueda para acercar</div><button class="fs" id="fs" aria-label="Pantalla completa">⤢</button></div><div class="points">${d.panos.map((p, i) => `<button data-i="${i}" class="${i ? '' : 'on'}">${esc(p.label)}</button>`).join('')}</div></section>` : ''}
+        ${d.panos.length ? `<section><h2 class="serif">Recorrido 360°</h2><div class="tour" id="tour"><canvas></canvas><div class="tload" id="tload">Cargando…</div><div class="hint">Arrastra para mirar alrededor · pellizca o usa la rueda para acercar</div><button class="fs" id="fs" aria-label="Pantalla completa">⤢</button></div><div class="points">${d.panos.map((p, i) => `<button data-i="${i}" class="${i ? '' : 'on'}">${esc(p.label)}</button>`).join('')}</div></section>` : ''}
         ${d.photos.length ? `<section><h2 class="serif">Así quedará</h2><div class="gallery">${d.photos.map(p => `<figure><img src="${p.image}" alt="${esc(p.label)}" loading="lazy"><figcaption>${esc(p.label)}</figcaption></figure>`).join('')}</div></section>` : ''}
         ${d.plan ? `<section><h2 class="serif">Planta</h2><div class="card plan">${d.plan}</div></section>` : ''}
         ${d.finishes.length ? `<section><h2 class="serif">Acabados</h2><div class="card fins">${d.finishes.map(f => `<div class="fin"><i style="background:${esc(f.color)}"></i><div><b>${esc(f.label)}</b>${esc(f.name)}</div></div>`).join('')}</div></section>` : ''}
@@ -184,7 +214,8 @@
     let yaw = 0, pitch = 0, fov = fov0(), ready = false;
     // Panorámica en la GPU: con mipmaps y filtro anisótropo; si el móvil no admite texturas tan grandes, se reduce antes.
     const maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE);
-    const load = i => { const img = new Image(); img.decoding = 'async'; img.onload = () => {
+    const load = i => { $('#tload').classList.add('on'); const img = new Image(); img.decoding = 'async'; img.onload = () => {
+      $('#tload').classList.remove('on');
       let src = img;
       if (img.width > maxTex) { const c = document.createElement('canvas'); c.width = maxTex; c.height = maxTex / 2; c.getContext('2d').drawImage(img, 0, 0, c.width, c.height); src = c; }
       gl.bindTexture(gl.TEXTURE_2D, tex); gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
